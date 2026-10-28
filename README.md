@@ -1,6 +1,19 @@
 # Authentication Log Analysis with Splunk Enterprise
 
-This project investigates authentication activity using Splunk Enterprise and a synthetic dataset of 1,200 authentication events. The analysis focuses on failed login attempts, targeted accounts, authentication outcomes, and suspicious patterns associated with password spraying.
+This project investigates authentication activity using Splunk Enterprise and a synthetic dataset of 1,200 Windows authentication events. The analysis focuses on failed login attempts, targeted accounts, authentication outcomes, and suspicious patterns associated with password spraying. It includes seven documented SPL queries, a threshold-based detection rule, investigation evidence, and a PDF report (case SOC-2026-001).
+
+> **Python follow-up:** the same dataset is analysed with Python in [authentication-log-analysis-python](https://github.com/okanalpturk0/authentication-log-analysis-python), which reproduces these findings with regex filtering and time-window detection rules.
+
+## Dataset
+
+| Property | Value |
+|---|---|
+| Events | 1,200 |
+| Period | 2026-10-19 to 2026-10-24 |
+| Splunk index / dataset | `main` / `small_company_auth_lab_v2` |
+| Source type | `windows_security` (Event ID 4624 successful logon, 4625 failed logon) |
+| Accounts / departments | 30 users across 7 departments |
+| Fields | `timestamp`, `username`, `source_ip`, `event_type`, `status`, `hostname`, `event_id`, `message`, `department`, `auth_method`, `mfa_result`, `source_type`, `dataset` |
 
 ## Investigation Results
 
@@ -10,28 +23,40 @@ This project investigates authentication activity using Splunk Enterprise and a 
 
 ### Suspicious Authentication Activity
 
-The investigation identified the following patterns:
+| Finding | Source IP | Account(s) | Failed attempts |
+|---|---|---|---|
+| Potential password spraying | `203.0.113.77` | 16 different accounts | 16 |
+| Repeated login failures | `198.51.100.24` | Charlie | 18 |
+| Repeated login failures | `192.0.2.44` | Dana | 14 |
+| Repeated login failures | `192.0.2.88` | Bob | 8 |
 
-- **Potential password spraying:** Source IP `203.0.113.77` generated 16 failed login attempts targeting 16 different accounts.
-- **Repeated login failures:** Charlie had 18 failed attempts from `198.51.100.24`.
-- **Repeated login failures:** Dana had 14 failed attempts from `192.0.2.44`.
-- **Repeated login failures:** Bob had 8 failed attempts from `192.0.2.88`.
+All 16 failed attempts from `203.0.113.77` targeted 16 different accounts, with no successful logon from that IP. The activity is consistent with potential password spraying because multiple accounts were targeted from a single source. The account-level failures (Charlie, Dana, Bob) are separate observations and should not be attributed to `203.0.113.77`. These findings warrant further investigation but do not independently confirm malicious intent or a successful account compromise.
 
-The activity associated with `203.0.113.77` is consistent with potential password spraying because multiple accounts were targeted from a single source. These findings warrant further investigation but do not independently confirm malicious intent or a successful account compromise.
+## Investigation Queries
 
-## Detection & Analysis
+The queries are documented in `authentication-queries.spl`. Each one includes its purpose, the reasoning behind the logic, what the results show, and an interpretation limitation.
 
-Splunk Enterprise was used to investigate authentication events through Search Processing Language (SPL) queries.
+| Query | Purpose |
+|---|---|
+| 01 | Authentication event overview with the fields needed for investigation |
+| 02 | Failed logins by source IP and username, with first and last attempt |
+| 03 | Failed logins per source IP with distinct targeted accounts (password spraying indicator) |
+| 04 | Chronological events from the suspicious source IP `203.0.113.77` |
+| 05 | Failed vs. successful logins for the accounts targeted from `203.0.113.77` |
+| 06 | Successful logins within one hour of an immediately preceding failure for the same account |
+| 07 | Authentication summary for `203.0.113.77` (total, failed, successful, targeted accounts) |
 
-The analysis focuses on:
+## Detection Rule
 
-- Comparing successful and failed authentication attempts.
-- Identifying accounts with repeated login failures.
-- Correlating source IP addresses with targeted accounts.
-- Investigating authentication patterns consistent with password spraying.
-- Documenting findings and supporting evidence.
+`detection-rule.spl` contains a threshold-based rule for potential password spraying (MITRE T1110.003):
 
-The detection logic highlights suspicious authentication behavior for further investigation. It represents an analytical detection approach and does not imply that a production alerting system was deployed.
+| Setting | Value |
+|---|---|
+| Logic | Distinct usernames with failed logins per source IP and 10-minute window |
+| Threshold | 10 or more distinct accounts |
+| Severity | Medium |
+
+The 16 accounts targeted from `203.0.113.77` within about two minutes exceed this threshold. The rule is documented for testing and tuning; no scheduled alert was configured or deployed, and a match indicates suspicious activity, not confirmed compromise.
 
 ## MITRE ATT&CK Mapping
 
@@ -41,6 +66,39 @@ The detection logic highlights suspicious authentication behavior for further in
 | Password Spraying | [T1110.003](https://attack.mitre.org/techniques/T1110/003/) | Relevant to the observed pattern of failed login attempts against multiple accounts from a single source IP. |
 
 These mappings provide a framework for classifying the investigated authentication patterns using the MITRE ATT&CK knowledge base. The observed activity is consistent with potential password spraying, but the available findings do not establish a confirmed attack or account compromise.
+
+## Repository Contents
+
+The `Splunk-Authentication-Investigation` folder contains:
+
+| File | Description |
+|---|---|
+| `small_company_authentication_events.csv` | Synthetic dataset (1,200 events) |
+| `authentication-queries.spl` | Seven documented investigation queries |
+| `detection-rule.spl` | Password spraying detection rule |
+| `report.pdf` | SOC investigation report with figures, findings, risk assessment, and recommended actions |
+| Screenshots | Splunk search results used as investigation evidence |
+
+## Related Project: Python Follow-up
+
+[authentication-log-analysis-python](https://github.com/okanalpturk0/authentication-log-analysis-python) continues this investigation the way an analyst would script a repeatable triage step after the SIEM search. It reads the same CSV and reproduces the results above, then extends them:
+
+| Splunk | Python equivalent |
+|---|---|
+| Query 01 (event overview) | Dataset summary in the generated report |
+| Query 02 (failed logins by IP and username) | `brute_force` rule |
+| Query 03 and `detection-rule.spl` (distinct accounts per IP) | `password_spraying` rule with a sliding time window |
+| Queries 04 and 07 (events and summary for one IP) | Follow-up check: any successful logon from the same IP afterwards |
+| Queries 05 and 06 (failure followed by success) | `success_after_failures` rule |
+
+What the Python version adds:
+
+- **A rule that covers all accounts.** Query 06 is scoped to the accounts targeted from `203.0.113.77`, so it does not cover Charlie, whose failures came from `198.51.100.24`. The Python rule runs across every account and flags a successful logon by Charlie 14 seconds after the 18 failed attempts, with no MFA required, which makes Charlie the strongest lead for follow-up.
+- **Sliding time windows** instead of fixed 10-minute buckets, so a burst cannot be split across a bucket boundary.
+- **Off-hours context:** the password spraying and Bob's failed attempts occurred outside business hours.
+- **Automated tests** that check the results against the Splunk numbers, plus an incident report and a findings CSV.
+
+The Python rules use lower thresholds (5 accounts in 10 minutes) than the Splunk rule (10 accounts), chosen for this dataset. Both thresholds would need tuning against normal behavior in a real environment.
 
 ## Tools & Technologies
 
