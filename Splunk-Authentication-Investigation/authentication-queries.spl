@@ -1,0 +1,261 @@
+/*
+PROJECT: Splunk Authentication Investigation
+INDEX: main
+DATASET: small_company_auth_lab_v2
+
+PURPOSE:
+Investigate authentication activity, identify suspicious failed-login
+patterns, examine targeted accounts, and identify potential follow-up
+detections.
+
+DATA NOTE:
+This project uses synthetic training data. The documented IP addresses
+are reserved for documentation and are not evidence of real-world attackers.
+
+HOW TO USE:
+Each numbered section is a separate SPL query.
+Run one query at a time in Splunk.
+*/
+
+/*
+============================================================
+QUERY 01 - Authentication Event Overview
+============================================================
+
+PURPOSE:
+Display authentication events and their relevant fields.
+
+WHY THIS LOGIC:
+The table command selects the fields needed for investigation.
+Sorting by descending event time places the newest events first.
+Filtering by index and dataset keeps the search focused on this lab.
+
+WHAT THE RESULTS SHOW:
+A chronological overview of authentication events, including usernames,
+source IPs, outcomes, authentication methods, MFA results, and hostnames.
+This provides context for the subsequent investigation.
+
+INTERPRETATION LIMITATION:
+The event overview alone does not establish malicious activity.
+*/
+
+index=main dataset="small_company_auth_lab_v2"
+| table _time username source_ip status event_id message department auth_method mfa_result hostname
+| sort - _time
+
+
+/*
+============================================================
+QUERY 02 - Failed Logins by Source IP and Username
+============================================================
+
+PURPOSE:
+Measure failed authentication attempts for each source IP and account.
+
+WHY THIS LOGIC:
+count calculates the number of failed events for each IP-user pair.
+min(_time) and max(_time) identify the first and last observed attempts.
+Grouping by both source_ip and username helps distinguish activity
+against individual accounts from activity involving multiple accounts.
+
+WHAT THE RESULTS SHOW:
+A list of IP-account pairs ranked by failed-attempt count, with the
+observed time range for each pair. Repeated failures may warrant
+additional investigation.
+
+INTERPRETATION LIMITATION:
+Repeated failures can also result from mistyped passwords,
+misconfigured applications, or legitimate user activity.
+*/
+
+index=main dataset="small_company_auth_lab_v2" status="failed"
+| stats count AS failed_attempts min(_time) AS first_attempt max(_time) AS last_attempt BY source_ip username
+| convert ctime(first_attempt) ctime(last_attempt)
+| sort - failed_attempts
+
+
+/*
+============================================================
+QUERY 03 - Failed Logins and Targeted Accounts by IP
+============================================================
+
+PURPOSE:
+Identify source IPs associated with failed logins against multiple accounts.
+
+WHY THIS LOGIC:
+count measures failed events per IP.
+dc(username) counts distinct targeted accounts.
+values(username) lists the usernames observed for each IP.
+The time fields show the earliest and latest observed failures.
+Sorting by targeted account count and then failed attempts prioritizes
+IPs that may warrant closer review.
+
+WHAT THE RESULTS SHOW:
+A per-IP summary of failed attempts, distinct targeted accounts,
+observed usernames, and time range. Activity against many accounts
+can be consistent with a password-spraying pattern.
+
+INTERPRETATION LIMITATION:
+This query summarizes the entire selected dataset time range.
+It does not enforce a short time window, so it is not by itself
+a time-bounded password-spraying detection rule.
+*/
+
+index=main dataset="small_company_auth_lab_v2" status="failed"
+| stats count AS failed_attempts dc(username) AS targeted_users values(username) AS usernames min(_time) AS first_attempt max(_time) AS last_attempt BY source_ip
+| convert ctime(first_attempt) ctime(last_attempt)
+| sort - targeted_users - failed_attempts
+
+
+/*
+============================================================
+QUERY 04 - Detailed Events from Suspicious Source IP
+============================================================
+
+PURPOSE:
+Inspect the authentication events associated with 203.0.113.77.
+
+WHY THIS LOGIC:
+Filtering by source_ip narrows the search to one source.
+The selected fields retain the event time, account, outcome,
+event details, authentication method, MFA result, and hostname.
+Sorting in ascending time order makes the sequence easier to review.
+
+WHAT THE RESULTS SHOW:
+The chronological authentication events associated with this IP,
+including failed and successful outcomes if present in the data.
+
+INTERPRETATION LIMITATION:
+203.0.113.77 is a documentation-range IP used in this synthetic lab.
+It must not be presented as a real external attacker.
+*/
+
+index=main dataset="small_company_auth_lab_v2" source_ip="203.0.113.77"
+| table _time username source_ip status event_id message auth_method mfa_result hostname
+| sort _time
+
+
+/*
+============================================================
+QUERY 05 - Authentication Summary for Targeted Accounts
+============================================================
+
+PURPOSE:
+Compare failed and successful authentication events for accounts
+that had failed attempts from 203.0.113.77.
+
+WHY THIS LOGIC:
+The subsearch selects usernames associated with failed events from
+the chosen source IP. The outer search then summarizes all matching
+authentication events for those usernames in the selected dataset.
+Conditional counts separate failed and successful events.
+The first and last successful event times provide additional context.
+
+WHAT THE RESULTS SHOW:
+For each selected account, the total failed and successful events
+and the earliest and latest successful event times observed in the
+dataset. These details help prioritize accounts for further review.
+
+INTERPRETATION LIMITATION:
+The summary does not prove that a successful login came from the
+same source IP. It also does not prove that a successful event
+was caused by a preceding failed attempt.
+*/
+
+index=main dataset="small_company_auth_lab_v2"
+[
+    search index=main dataset="small_company_auth_lab_v2" source_ip="203.0.113.77" status="failed"
+    | stats count BY username
+    | fields username
+]
+| stats
+    count(eval(status="failed")) AS failed_logins
+    count(eval(status="success")) AS successful_logins
+    min(eval(if(status="success", _time, null()))) AS first_success
+    max(eval(if(status="success", _time, null()))) AS last_success
+    BY username
+| eval first_success=if(isnull(first_success), "No successful login", strftime(first_success, "%Y-%m-%d %H:%M:%S"))
+| eval last_success=if(isnull(last_success), "No successful login", strftime(last_success, "%Y-%m-%d %H:%M:%S"))
+| table username failed_logins successful_logins first_success last_success
+| sort - failed_logins
+
+
+/*
+============================================================
+QUERY 06 - Failed Event Immediately Followed by Success
+============================================================
+
+PURPOSE:
+Find successful events occurring within one hour of the immediately
+preceding failed event for the same username, for accounts targeted
+by failed attempts from 203.0.113.77.
+
+WHY THIS LOGIC:
+The subsearch selects accounts that had failed attempts from the
+chosen source. sort 0 _time orders their events chronologically.
+streamstats retrieves the preceding event's status and timestamp
+for each username. The where condition selects a success whose
+immediately preceding event was a failure no more than 3600 seconds
+earlier.
+
+WHAT THE RESULTS SHOW:
+Matching username-event sequences, the previous event time, the
+successful event time, and the elapsed seconds between them.
+These matches can help analysts decide which events to investigate.
+
+INTERPRETATION LIMITATION:
+The immediately preceding failure may have come from another source.
+This query does not establish that the success came from
+203.0.113.77 or that an account was compromised. It can also miss
+a relevant failure if another event occurs between the failure
+and success.
+*/
+
+index=main dataset="small_company_auth_lab_v2"
+[
+    search index=main dataset="small_company_auth_lab_v2" source_ip="203.0.113.77" status="failed"
+    | stats count BY username
+    | fields username
+]
+| sort 0 _time
+| streamstats current=f last(status) AS previous_status last(_time) AS previous_time BY username
+| eval seconds_since_previous=_time-previous_time
+| where status="success" AND previous_status="failed" AND seconds_since_previous>=0 AND seconds_since_previous<=3600
+| eval seconds_since_previous=round(seconds_since_previous,0)
+| table username previous_time _time seconds_since_previous source_ip status hostname auth_method mfa_result
+| sort seconds_since_previous
+
+
+/*
+============================================================
+QUERY 07 - Authentication Summary for a Specific Source IP
+============================================================
+
+PURPOSE:
+Summarize the total authentication activity associated with
+203.0.113.77.
+
+WHY THIS LOGIC:
+count calculates all matching events.
+Conditional counts separate successful and failed logins.
+dc(username) counts the distinct accounts represented in the events.
+The final table presents a compact summary for reporting.
+
+WHAT THE RESULTS SHOW:
+The total observed events, number of distinct usernames,
+failed logins, and successful logins associated with this source.
+
+INTERPRETATION LIMITATION:
+This query covers the selected dataset time range and is a summary,
+not a time-windowed alert. The targeted account count can include
+accounts with any recorded outcome, not only failed attempts.
+*/
+
+index=main dataset="small_company_auth_lab_v2" source_ip="203.0.113.77"
+| stats
+    count AS total_attempts
+    count(eval(status="success")) AS successful_logins
+    count(eval(status="failed")) AS failed_logins
+    dc(username) AS targeted_accounts
+    BY source_ip
+| table source_ip total_attempts targeted_accounts failed_logins successful_logins

@@ -1,0 +1,39 @@
+/*
+Detection: Potential Password Spraying
+Platform: Splunk Enterprise
+Data: Synthetic authentication logs
+MITRE ATT&CK: T1110.003 - Password Spraying
+
+Purpose:
+Detect a source IP generating failed logins against 10 or more
+distinct accounts within a 10-minute time window.
+
+Detection logic:
+Count distinct usernames per source IP and 10-minute window.
+Return matches meeting the configured threshold.
+
+Severity: Medium
+Threshold: 10 distinct accounts
+Time window: 10 minutes
+
+Validation:
+Test against the lab dataset before enabling a scheduled alert.
+A match indicates suspicious activity, not confirmed compromise.
+Tune the threshold to reduce false positives before production use.
+*/
+
+index=main dataset="small_company_auth_lab_v2" status="failed"
+| bin _time span=10m
+| stats
+    count AS failed_attempts
+    dc(username) AS targeted_accounts
+    values(username) AS usernames
+    min(_time) AS window_start
+    max(_time) AS window_end
+    BY source_ip _time
+| where targeted_accounts >= 10
+| eval detection_name="Potential Password Spraying"
+| eval severity="medium"
+| convert ctime(window_start) ctime(window_end)
+| table detection_name severity source_ip targeted_accounts failed_attempts usernames window_start window_end
+| sort - targeted_accounts - failed_attempts
